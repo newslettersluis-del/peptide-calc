@@ -2635,6 +2635,60 @@ async function cancelAllScheduledNotifications() {
   saveApp();
 }
 
+async function getOneSignalDiagnostics() {
+  const out = {
+    permission: typeof Notification !== 'undefined' ? Notification.permission : 'no Notification',
+    OS_loaded: !!window.OneSignal,
+    SW_supported: 'serviceWorker' in navigator,
+  };
+  try {
+    const ps = window.OneSignal && window.OneSignal.User && window.OneSignal.User.PushSubscription;
+    if (ps) {
+      out.PS_optedIn = ps.optedIn;
+      out.PS_id = ps.id || null;
+      out.PS_token = ps.token ? 'present' : null;
+    } else {
+      out.PS_optedIn = 'N/A';
+    }
+    out.OS_userId = (window.OneSignal && window.OneSignal.User && window.OneSignal.User.onesignalId) || null;
+  } catch(e) { out.PS_error = String(e); }
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      out.SW_regs = regs.map(function(r){ return r.scope; });
+      out.SW_active = regs.filter(function(r){ return r.active; }).length;
+    }
+  } catch(e) { out.SW_error = String(e); }
+  return out;
+}
+
+async function waitForSubscriptionId(timeoutMs) {
+  return new Promise(function(resolve){
+    let done = false;
+    function finish(val){
+      if (done) return; done = true;
+      try { ps && ps.removeEventListener && ps.removeEventListener('change', listener); } catch(e){}
+      resolve(val);
+    }
+    const ps = window.OneSignal && window.OneSignal.User && window.OneSignal.User.PushSubscription;
+    if (!ps) { finish(null); return; }
+    if (ps.id) { finish(ps.id); return; }
+    function listener(ev) {
+      try {
+        const id = (ev && ev.current && ev.current.id) || ps.id;
+        if (id) finish(id);
+      } catch(e){}
+    }
+    try { ps.addEventListener('change', listener); } catch(e){}
+    // Poll fallback
+    const interval = setInterval(function(){
+      if (done) { clearInterval(interval); return; }
+      if (ps.id) { clearInterval(interval); finish(ps.id); }
+    }, 400);
+    setTimeout(function(){ clearInterval(interval); finish(null); }, timeoutMs || 20000);
+  });
+}
+
 async function enableNotifications() {
   if (!('Notification' in window)) {
     alert('Tu navegador no soporta notificaciones.');
@@ -2651,49 +2705,45 @@ async function enableNotifications() {
   const btn = document.getElementById('notif-enable-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Activando…'; }
   try {
-    // Step 1: ask for browser notification permission
+    // Step 1: browser permission
     if (Notification.permission !== 'granted') {
-      try {
-        await window.OneSignal.Notifications.requestPermission();
-      } catch(e) { console.warn('requestPermission failed:', e); }
+      try { await window.OneSignal.Notifications.requestPermission(); } catch(e) { console.warn('requestPermission:', e); }
     }
     if (Notification.permission !== 'granted') {
-      alert('No se concedió el permiso de notificaciones. Acepta el cuadro emergente del navegador cuando aparezca.');
+      alert('No se concedió el permiso de notificaciones.');
       if (btn) { btn.disabled = false; btn.textContent = 'Activar notificaciones'; }
       return;
     }
 
-    // Step 2: explicitly opt in to OneSignal push subscription
-    if (window.OneSignal.User && window.OneSignal.User.PushSubscription) {
-      try {
+    // Step 2: opt in
+    try {
+      if (window.OneSignal.User && window.OneSignal.User.PushSubscription) {
         await window.OneSignal.User.PushSubscription.optIn();
-      } catch(e) { console.warn('optIn warning (may already be opted in):', e); }
-    }
+      }
+    } catch(e) { console.warn('optIn:', e); }
 
-    // Step 3: wait up to 15s for subscription ID to materialize
-    let subId = await getOneSignalSubId();
-    let waited = 0;
-    while (!subId && waited < 15000) {
-      await new Promise(function(r){ setTimeout(r, 300); });
-      waited += 300;
-      subId = await getOneSignalSubId();
-    }
+    // Step 3: wait up to 25s for subscription ID via event listener
+    const subId = await waitForSubscriptionId(25000);
 
     if (!subId) {
-      const diag = [
+      const d = await getOneSignalDiagnostics();
+      const lines = [
         'No se pudo obtener tu ID de suscripción.',
         '',
-        'Diagnóstico:',
-        '• Permiso del navegador: ' + Notification.permission,
-        '• OneSignal cargado: ' + (!!window.OneSignal ? 'sí' : 'no'),
-        '• Service worker: ' + (('serviceWorker' in navigator) ? 'soportado' : 'no soportado'),
-        '',
-        'Intenta:',
-        '1. Cerrar la app y volver a abrirla',
-        '2. Desinstalar la PWA y reinstalarla desde la URL en Chrome',
-        '3. Esperar 30s después de tocar Activar (la primera vez tarda)'
-      ].join('\n');
-      alert(diag);
+        'Diagnóstico detallado:',
+        '• Permiso navegador: ' + d.permission,
+        '• OneSignal cargado: ' + d.OS_loaded,
+        '• OptedIn: ' + d.PS_optedIn,
+        '• PushSub.id: ' + d.PS_id,
+        '• PushSub.token: ' + d.PS_token,
+        '• OneSignal userId: ' + d.OS_userId,
+        '• SW activos: ' + (d.SW_active || 0),
+        '• SW scopes: ' + ((d.SW_regs || []).join(', ') || 'ninguno'),
+      ];
+      if (d.PS_error) lines.push('• Error PS: ' + d.PS_error);
+      if (d.SW_error) lines.push('• Error SW: ' + d.SW_error);
+      lines.push('', 'Mándale screenshot de esta info al desarrollador.');
+      alert(lines.join('\n'));
       if (btn) { btn.disabled = false; btn.textContent = 'Activar notificaciones'; }
       return;
     }
@@ -2704,7 +2754,7 @@ async function enableNotifications() {
     showToast('🔔', 'Notificaciones activadas', 'Recibirás avisos de tus dosis');
   } catch(err) {
     console.error(err);
-    alert('Error activando notificaciones: ' + (err && err.message || err));
+    alert('Error: ' + (err && err.message || err));
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Activar notificaciones'; }
     updateNotificationsUI();
