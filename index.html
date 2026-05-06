@@ -23,7 +23,7 @@
       await OneSignal.init({
         appId: "a0babc7d-078e-44f9-a960-85871799bf31",
         serviceWorkerParam: { scope: "/peptide-calc/" },
-        serviceWorkerPath: "service-worker.js",
+        serviceWorkerPath: "OneSignalSDKWorker.js",
         allowLocalhostAsSecureOrigin: false,
         autoResubscribe: true,
         autoRegister: false,
@@ -2940,12 +2940,17 @@ document.addEventListener('onesignal-ready', function(){ setTimeout(updateNotifi
   }
 })();
 
-// Register service worker for PWA / offline
+// Service worker is registered by OneSignal SDK — we don't double-register.
+// (When OneSignal isn't available, fall back to our own registration so offline still works.)
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', function(){
-    navigator.serviceWorker.register('service-worker.js').catch(function(err){
-      console.warn('SW registration failed:', err);
-    });
+    setTimeout(function(){
+      if (!window.OneSignal) {
+        navigator.serviceWorker.register('OneSignalSDKWorker.js').catch(function(err){
+          console.warn('SW registration failed:', err);
+        });
+      }
+    }, 5000);
   });
 }
 
