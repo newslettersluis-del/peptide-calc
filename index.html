@@ -26,7 +26,12 @@
         serviceWorkerPath: "service-worker.js",
         allowLocalhostAsSecureOrigin: false,
         autoResubscribe: true,
-        notifyButton: { enable: false }
+        autoRegister: false,
+        notifyButton: { enable: false },
+        promptOptions: {
+          slidedown: { prompts: [] },
+          autoPrompt: false
+        }
       });
       window.__oneSignalReady = true;
       window.OneSignal = OneSignal;
