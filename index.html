@@ -2651,18 +2651,49 @@ async function enableNotifications() {
   const btn = document.getElementById('notif-enable-btn');
   if (btn) { btn.disabled = true; btn.textContent = 'Activando…'; }
   try {
+    // Step 1: ask for browser notification permission
     if (Notification.permission !== 'granted') {
-      await window.OneSignal.Notifications.requestPermission();
+      try {
+        await window.OneSignal.Notifications.requestPermission();
+      } catch(e) { console.warn('requestPermission failed:', e); }
     }
+    if (Notification.permission !== 'granted') {
+      alert('No se concedió el permiso de notificaciones. Acepta el cuadro emergente del navegador cuando aparezca.');
+      if (btn) { btn.disabled = false; btn.textContent = 'Activar notificaciones'; }
+      return;
+    }
+
+    // Step 2: explicitly opt in to OneSignal push subscription
+    if (window.OneSignal.User && window.OneSignal.User.PushSubscription) {
+      try {
+        await window.OneSignal.User.PushSubscription.optIn();
+      } catch(e) { console.warn('optIn warning (may already be opted in):', e); }
+    }
+
+    // Step 3: wait up to 15s for subscription ID to materialize
     let subId = await getOneSignalSubId();
     let waited = 0;
-    while (!subId && waited < 5000) {
-      await new Promise(function(r){ setTimeout(r, 250); });
-      waited += 250;
+    while (!subId && waited < 15000) {
+      await new Promise(function(r){ setTimeout(r, 300); });
+      waited += 300;
       subId = await getOneSignalSubId();
     }
+
     if (!subId) {
-      alert('No se pudo obtener tu ID de suscripción. Asegúrate de aceptar el permiso de notificaciones.');
+      const diag = [
+        'No se pudo obtener tu ID de suscripción.',
+        '',
+        'Diagnóstico:',
+        '• Permiso del navegador: ' + Notification.permission,
+        '• OneSignal cargado: ' + (!!window.OneSignal ? 'sí' : 'no'),
+        '• Service worker: ' + (('serviceWorker' in navigator) ? 'soportado' : 'no soportado'),
+        '',
+        'Intenta:',
+        '1. Cerrar la app y volver a abrirla',
+        '2. Desinstalar la PWA y reinstalarla desde la URL en Chrome',
+        '3. Esperar 30s después de tocar Activar (la primera vez tarda)'
+      ].join('\n');
+      alert(diag);
       if (btn) { btn.disabled = false; btn.textContent = 'Activar notificaciones'; }
       return;
     }
@@ -2673,7 +2704,7 @@ async function enableNotifications() {
     showToast('🔔', 'Notificaciones activadas', 'Recibirás avisos de tus dosis');
   } catch(err) {
     console.error(err);
-    alert('Error activando notificaciones: ' + err.message);
+    alert('Error activando notificaciones: ' + (err && err.message || err));
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = 'Activar notificaciones'; }
     updateNotificationsUI();
