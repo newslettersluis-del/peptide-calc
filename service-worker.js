@@ -1,10 +1,11 @@
-const CACHE_NAME = 'peptide-calc-v1';
+const CACHE_NAME = 'peptide-calc-v3';
 const ASSETS = [
   './',
   './index.html',
   './manifest.json',
   './icon-192.png',
-  './icon-512.png'
+  './icon-512.png',
+  './icon-512-maskable.png'
 ];
 
 self.addEventListener('install', (event) => {
@@ -32,7 +33,6 @@ self.addEventListener('fetch', (event) => {
       if (cached) return cached;
       return fetch(event.request)
         .then((res) => {
-          // Cache same-origin successful responses
           if (
             res &&
             res.status === 200 &&
