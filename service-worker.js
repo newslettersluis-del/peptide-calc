@@ -1,4 +1,7 @@
-const CACHE_NAME = 'peptide-calc-v4';
+// Import OneSignal Web SDK so push notifications work in this service worker
+importScripts('https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.sw.js');
+
+const CACHE_NAME = 'peptide-calc-v5';
 const ASSETS = [
   './',
   './index.html',
@@ -28,6 +31,10 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
+  // Don't intercept OneSignal SDK or push-related requests
+  const url = event.request.url;
+  if (url.includes('onesignal.com') || url.includes('os.tc')) return;
+
   event.respondWith(
     caches.match(event.request).then((cached) => {
       if (cached) return cached;

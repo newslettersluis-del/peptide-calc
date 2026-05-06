@@ -13,6 +13,29 @@
 <link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
 <link rel="apple-touch-icon" href="icon-192.png">
 <title>Peptide Calculator</title>
+
+<!-- OneSignal Web Push SDK -->
+<script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
+<script>
+  window.OneSignalDeferred = window.OneSignalDeferred || [];
+  window.OneSignalDeferred.push(async function(OneSignal) {
+    try {
+      await OneSignal.init({
+        appId: "a0babc7d-078e-44f9-a960-85871799bf31",
+        serviceWorkerParam: { scope: "/peptide-calc/" },
+        serviceWorkerPath: "service-worker.js",
+        allowLocalhostAsSecureOrigin: false,
+        autoResubscribe: true,
+        notifyButton: { enable: false }
+      });
+      window.__oneSignalReady = true;
+      window.OneSignal = OneSignal;
+      document.dispatchEvent(new CustomEvent('onesignal-ready'));
+    } catch (err) {
+      console.warn('OneSignal init failed:', err);
+    }
+  });
+</script>
 <style>
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body {
@@ -890,12 +913,27 @@
 <!-- SETTINGS TAB -->
 <div id="tab-settings" class="tab">
   <div class="header">Settings</div>
-  <div class="placeholder">
-    <h2>Settings</h2>
-    <p>Versión 2.0 · Construida para uso personal.</p>
-    <button class="btn-secondary" style="max-width:300px;margin:16px auto" onclick="exportData()">Exportar datos</button>
-    <button class="btn-secondary" style="max-width:300px;margin:8px auto" onclick="importData()">Importar datos</button>
-    <button class="btn-secondary" style="max-width:300px;margin:8px auto;color:#ff6b4a;border-color:rgba(255,107,74,0.3)" onclick="clearAllData()">Borrar todos los datos</button>
+  <div style="padding:0 16px 100px;max-width:560px;margin:0 auto">
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-title"><span class="icon">🔔</span> Notificaciones</div>
+      <div id="notif-status" style="font-size:14px;color:#8b95a8;margin-bottom:12px">Cargando…</div>
+      <button id="notif-enable-btn" class="btn-secondary" style="display:none" onclick="enableNotifications()">Activar notificaciones</button>
+      <button id="notif-reschedule-btn" class="btn-secondary" style="display:none;margin-top:8px" onclick="rescheduleNotifications()">Reagendar próximas dosis</button>
+      <button id="notif-disable-btn" class="btn-secondary" style="display:none;margin-top:8px;color:#ff6b4a;border-color:rgba(255,107,74,0.3)" onclick="disableNotifications()">Desactivar y limpiar</button>
+      <div id="notif-info" style="font-size:12px;color:#6b7280;margin-top:10px;line-height:1.5"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <div class="card-title"><span class="icon">💾</span> Datos</div>
+      <button class="btn-secondary" style="margin-top:4px" onclick="exportData()">Exportar datos</button>
+      <button class="btn-secondary" style="margin-top:8px" onclick="importData()">Importar datos</button>
+      <button class="btn-secondary" style="margin-top:8px;color:#ff6b4a;border-color:rgba(255,107,74,0.3)" onclick="clearAllData()">Borrar todos los datos</button>
+    </div>
+
+    <div style="text-align:center;margin-top:24px;color:#6b7280;font-size:12px">
+      Peptide Calculator · Construida para uso personal
+    </div>
   </div>
 </div>
 
@@ -999,7 +1037,8 @@ const calcState = {
 
 let appData = {
   protocols: [],
-  selectedDate: null
+  selectedDate: null,
+  notifications: { enabled: false, scheduledIds: [], lastSync: null, subscriptionId: null }
 };
 
 let saveDraft = null; // current draft of new protocol
@@ -1013,7 +1052,12 @@ function loadCalc() {
 }
 function saveApp() { try { localStorage.setItem('peptideApp', JSON.stringify(appData)); } catch(e){} }
 function loadApp() {
-  try { const s = localStorage.getItem('peptideApp'); if (s) Object.assign(appData, JSON.parse(s)); } catch(e){}
+  try {
+    const s = localStorage.getItem('peptideApp');
+    if (s) Object.assign(appData, JSON.parse(s));
+    // Ensure notifications object exists for older saved data
+    if (!appData.notifications) appData.notifications = { enabled: false, scheduledIds: [], lastSync: null, subscriptionId: null };
+  } catch(e){}
 }
 
 // ===================== TAB SWITCHING =====================
@@ -1026,6 +1070,7 @@ document.querySelectorAll('.footer button').forEach(btn => {
     document.getElementById('tab-' + t).classList.add('active');
     if (t === 'protocols') renderProtocolsList();
     if (t === 'schedule') renderSchedule();
+    if (t === 'settings') updateNotificationsUI();
     window.scrollTo(0,0);
   });
 });
@@ -1841,6 +1886,7 @@ function saveProtocol() {
   saveApp();
   closeSaveModal();
   showToast('✓', 'Protocolo guardado!', protocol.name);
+  if (appData.notifications && appData.notifications.enabled) rescheduleNotifications(true);
   // Switch to Protocols tab
   document.querySelectorAll('.footer button').forEach(b => b.classList.remove('active'));
   document.querySelector('.footer button[data-tab="protocols"]').classList.add('active');
@@ -2072,6 +2118,7 @@ function deleteProtocol(pid) {
   appData.protocols = appData.protocols.filter(p => p.id !== pid);
   saveApp();
   closeDetailModal();
+  if (appData.notifications && appData.notifications.enabled) rescheduleNotifications(true);
 }
 function estimateRunoutDate(p, totalDoses, used) {
   if (!p.schedule.enabled) return null;
@@ -2492,6 +2539,231 @@ $('log-backdrop').addEventListener('click', closeLogModal);
 $('color-backdrop').addEventListener('click', closeColorModal);
 $('detail-backdrop').addEventListener('click', closeDetailModal);
 
+// ===================== NOTIFICATIONS (OneSignal + Cloudflare Worker) =====================
+const NOTIF_WORKER_URL = 'https://peptide-notif.newsletters-luis.workers.dev';
+const NOTIF_LOOKAHEAD_DAYS = 30;
+const NOTIF_MAX_PER_BATCH = 120;
+
+async function getOneSignalSubId() {
+  if (!window.OneSignal) return null;
+  try {
+    const sub = window.OneSignal.User?.PushSubscription;
+    if (sub && sub.id) return sub.id;
+  } catch(e){}
+  return null;
+}
+
+function notifFmtTime(t) {
+  const parts = (t || '08:00').split(':').map(Number);
+  const h = parts[0]; const m = parts[1];
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12 = ((h + 11) % 12) + 1;
+  return h12 + ':' + String(m).padStart(2,'0') + ' ' + ampm;
+}
+
+function getDoseValueForDate(p, date) {
+  if (!p.titration || !p.titration.enabled) return (p.titration && p.titration.startDose) || 0;
+  const start = new Date(p.schedule.startDate + 'T00:00:00');
+  let count = 0;
+  for (let i = 0; i < 730; i++) {
+    const d = new Date(start.getTime() + i*86400000);
+    if (d > date) break;
+    if (isDoseDay(d, p)) {
+      const times = (p.schedule.doseTimes || ['08:00']).length;
+      for (let j = 0; j < times; j++) {
+        if (d.getTime() === date.getTime()) {
+          const steps = computeTitrationSteps(p.titration, p.schedule);
+          return steps[Math.min(count, steps.length-1)];
+        }
+        count++;
+      }
+    }
+  }
+  const steps = computeTitrationSteps(p.titration, p.schedule);
+  return steps[Math.min(count, steps.length-1)];
+}
+
+function computeUpcomingDoses(days) {
+  if (typeof days !== 'number') days = NOTIF_LOOKAHEAD_DAYS;
+  const list = [];
+  const now = new Date();
+  for (let pi = 0; pi < appData.protocols.length; pi++) {
+    const p = appData.protocols[pi];
+    if (!p.schedule || !p.schedule.enabled) continue;
+    const times = (p.schedule.doseTimes && p.schedule.doseTimes.length) ? p.schedule.doseTimes : ['08:00'];
+    for (let i = 0; i < days; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + i);
+      if (!isDoseDay(d, p)) continue;
+      for (let ti = 0; ti < times.length; ti++) {
+        const t = times[ti];
+        const parts = t.split(':').map(Number);
+        const dt = new Date(d);
+        dt.setHours(parts[0]||0, parts[1]||0, 0, 0);
+        if (dt.getTime() <= now.getTime() + 60*1000) continue;
+        const dose = getDoseValueForDate(p, d);
+        const unit = (p.titration && p.titration.unit) || 'mg';
+        const peptideName = (p.peptideNames && p.peptideNames[0]) || p.name || 'Peptide';
+        list.push({
+          timestamp: dt.getTime(),
+          title: 'Hora de ' + peptideName,
+          body: dose + ' ' + unit + ' · ' + notifFmtTime(t),
+          tag: p.id + '-' + dt.toISOString().slice(0,16)
+        });
+      }
+    }
+  }
+  list.sort(function(a,b){ return a.timestamp - b.timestamp; });
+  return list.slice(0, NOTIF_MAX_PER_BATCH);
+}
+
+async function cancelAllScheduledNotifications() {
+  const ids = (appData.notifications.scheduledIds || []).slice();
+  if (ids.length === 0) return;
+  try {
+    await fetch(NOTIF_WORKER_URL + '/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notificationIds: ids })
+    });
+  } catch(e){ console.warn('Cancel failed:', e); }
+  appData.notifications.scheduledIds = [];
+  saveApp();
+}
+
+async function enableNotifications() {
+  if (!('Notification' in window)) {
+    alert('Tu navegador no soporta notificaciones.');
+    return;
+  }
+  if (Notification.permission === 'denied') {
+    alert('Las notificaciones están bloqueadas. Actívalas desde Configuración del navegador → Notificaciones.');
+    return;
+  }
+  if (!window.OneSignal) {
+    alert('OneSignal aún se está cargando. Inténtalo de nuevo en unos segundos.');
+    return;
+  }
+  const btn = document.getElementById('notif-enable-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Activando…'; }
+  try {
+    if (Notification.permission !== 'granted') {
+      await window.OneSignal.Notifications.requestPermission();
+    }
+    let subId = await getOneSignalSubId();
+    let waited = 0;
+    while (!subId && waited < 5000) {
+      await new Promise(function(r){ setTimeout(r, 250); });
+      waited += 250;
+      subId = await getOneSignalSubId();
+    }
+    if (!subId) {
+      alert('No se pudo obtener tu ID de suscripción. Asegúrate de aceptar el permiso de notificaciones.');
+      if (btn) { btn.disabled = false; btn.textContent = 'Activar notificaciones'; }
+      return;
+    }
+    appData.notifications.enabled = true;
+    appData.notifications.subscriptionId = subId;
+    saveApp();
+    await rescheduleNotifications(true);
+    showToast('🔔', 'Notificaciones activadas', 'Recibirás avisos de tus dosis');
+  } catch(err) {
+    console.error(err);
+    alert('Error activando notificaciones: ' + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Activar notificaciones'; }
+    updateNotificationsUI();
+  }
+}
+
+async function disableNotifications() {
+  if (!confirm('¿Desactivar notificaciones y cancelar todas las próximas dosis agendadas?')) return;
+  await cancelAllScheduledNotifications();
+  appData.notifications.enabled = false;
+  saveApp();
+  updateNotificationsUI();
+  showToast('✓', 'Notificaciones desactivadas', '');
+}
+
+async function rescheduleNotifications(silent) {
+  if (!appData.notifications.enabled) return;
+  const subId = appData.notifications.subscriptionId || (await getOneSignalSubId());
+  if (!subId) {
+    if (!silent) alert('No se encontró tu ID de suscripción. Vuelve a activar notificaciones.');
+    return;
+  }
+  const btn = document.getElementById('notif-reschedule-btn');
+  if (btn && !silent) { btn.disabled = true; btn.textContent = 'Reagendando…'; }
+  try {
+    await cancelAllScheduledNotifications();
+    const upcoming = computeUpcomingDoses();
+    if (upcoming.length === 0) {
+      appData.notifications.lastSync = Date.now();
+      saveApp();
+      if (!silent) showToast('ℹ️', 'Sin dosis próximas', 'No hay nada que agendar en los próximos ' + NOTIF_LOOKAHEAD_DAYS + ' días');
+      updateNotificationsUI();
+      return;
+    }
+    const resp = await fetch(NOTIF_WORKER_URL + '/schedule', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscriptionId: subId, notifications: upcoming })
+    });
+    if (!resp.ok) throw new Error('Worker respondió ' + resp.status);
+    const data = await resp.json();
+    const ids = (data.results || []).filter(function(r){ return r.ok && r.notificationId; }).map(function(r){ return r.notificationId; });
+    const failed = (data.results || []).filter(function(r){ return !r.ok; }).length;
+    appData.notifications.scheduledIds = ids;
+    appData.notifications.lastSync = Date.now();
+    saveApp();
+    if (!silent) {
+      const msg = failed > 0 ? (ids.length + ' agendadas · ' + failed + ' con error') : (ids.length + ' dosis agendadas');
+      showToast('🔔', 'Notificaciones listas', msg);
+    }
+  } catch(err) {
+    console.error(err);
+    if (!silent) alert('Error: ' + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Reagendar próximas dosis'; }
+    updateNotificationsUI();
+  }
+}
+
+function updateNotificationsUI() {
+  const status = document.getElementById('notif-status');
+  const enableBtn = document.getElementById('notif-enable-btn');
+  const reBtn = document.getElementById('notif-reschedule-btn');
+  const disBtn = document.getElementById('notif-disable-btn');
+  const info = document.getElementById('notif-info');
+  if (!status) return;
+
+  if (!('Notification' in window)) {
+    status.textContent = '❌ Tu navegador no soporta notificaciones';
+    enableBtn.style.display = 'none'; reBtn.style.display = 'none'; disBtn.style.display = 'none';
+    return;
+  }
+  if (Notification.permission === 'denied') {
+    status.innerHTML = '🚫 <span style="color:#ff6b4a">Bloqueadas en el navegador</span>';
+    info.innerHTML = 'Activa los permisos en Chrome → Configuración del sitio → Notificaciones';
+    enableBtn.style.display = 'none'; reBtn.style.display = 'none'; disBtn.style.display = 'none';
+    return;
+  }
+  if (!appData.notifications.enabled) {
+    status.innerHTML = '⚪ Inactivas';
+    info.innerHTML = 'Recibirás un push real (incluso con la app cerrada) a la hora exacta de cada dosis. Te recomiendo además poner una alarma de respaldo en tu reloj.';
+    enableBtn.style.display = ''; reBtn.style.display = 'none'; disBtn.style.display = 'none';
+    return;
+  }
+  const count = (appData.notifications.scheduledIds || []).length;
+  const last = appData.notifications.lastSync ? new Date(appData.notifications.lastSync) : null;
+  const lastTxt = last ? (last.toLocaleDateString('es-ES',{day:'numeric',month:'short'}) + ' ' + last.toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit'})) : 'nunca';
+  status.innerHTML = '🟢 <span style="color:#4ade80">Activas</span> · ' + count + ' dosis agendadas';
+  info.innerHTML = 'Última sincronización: ' + lastTxt + '<br>Mira los próximos ' + NOTIF_LOOKAHEAD_DAYS + ' días. Reagéndalas si cambias un protocolo o no aparece una notificación esperada.';
+  enableBtn.style.display = 'none'; reBtn.style.display = ''; disBtn.style.display = '';
+}
+
+document.addEventListener('DOMContentLoaded', function(){ setTimeout(updateNotificationsUI, 200); });
+document.addEventListener('onesignal-ready', function(){ setTimeout(updateNotificationsUI, 200); });
+
 // iOS-style custom select picker (intercepts native dropdowns)
 (function() {
   let lastOpenAt = 0;
@@ -2518,7 +2790,7 @@ $('detail-backdrop').addEventListener('click', closeDetailModal);
   document.addEventListener('mousedown', intercept, true);
   document.addEventListener('touchstart', intercept, {capture:true, passive:false});
   document.addEventListener('click', interceptSilent, true);
-  document.addEventListener('keydown', (e) => {
+  document.addEventListener('keydown', function(e){
     const sel = e.target.closest && e.target.closest('select');
     if (!sel || sel.disabled) return;
     if (e.key === ' ' || e.key === 'Enter' || e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -2546,7 +2818,7 @@ $('detail-backdrop').addEventListener('click', closeDetailModal);
       label.textContent = opt.textContent;
       div.appendChild(check);
       div.appendChild(label);
-      div.addEventListener('click', () => {
+      div.addEventListener('click', function(){
         if (opt.value !== sel.value) {
           sel.value = opt.value;
           sel.dispatchEvent(new Event('change', {bubbles:true}));
@@ -2556,13 +2828,13 @@ $('detail-backdrop').addEventListener('click', closeDetailModal);
       return div;
     }
 
-    Array.from(sel.children).forEach(node => {
+    Array.from(sel.children).forEach(function(node){
       if (node.tagName === 'OPTGROUP') {
         const lbl = document.createElement('div');
         lbl.className = 'cs-group-label';
         lbl.textContent = node.label;
         sheet.appendChild(lbl);
-        Array.from(node.children).forEach(o => sheet.appendChild(makeOption(o)));
+        Array.from(node.children).forEach(function(o){ sheet.appendChild(makeOption(o)); });
       } else if (node.tagName === 'OPTION') {
         sheet.appendChild(makeOption(node));
       }
@@ -2574,9 +2846,9 @@ $('detail-backdrop').addEventListener('click', closeDetailModal);
 
     function close() {
       overlay.style.animation = 'csFadeIn 0.14s ease-in reverse';
-      setTimeout(() => overlay.remove(), 140);
+      setTimeout(function(){ overlay.remove(); }, 140);
     }
-    overlay.addEventListener('click', (e) => {
+    overlay.addEventListener('click', function(e){
       if (e.target === overlay) close();
     });
   }
@@ -2584,8 +2856,8 @@ $('detail-backdrop').addEventListener('click', closeDetailModal);
 
 // Register service worker for PWA / offline
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('service-worker.js').catch(err => {
+  window.addEventListener('load', function(){
+    navigator.serviceWorker.register('service-worker.js').catch(function(err){
       console.warn('SW registration failed:', err);
     });
   });
